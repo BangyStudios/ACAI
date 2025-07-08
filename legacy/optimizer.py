@@ -1,4 +1,4 @@
-import src.controller as controller
+import legacy.controller as controller
 import time
 import datetime
 

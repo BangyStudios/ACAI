@@ -1,4 +1,4 @@
-import src.controller as controller
+import legacy.controller as controller
 controller = controller.Controller("192.168.0.14")
 
 import time

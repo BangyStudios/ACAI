@@ -1,11 +1,11 @@
-from lib.api.airtouch4pyapi.airtouch import AirTouch
+from lib.airtouch4pyapi.airtouch4pyapi.airtouch import AirTouch, AirTouchVersion
+import asyncio
 
 class Controller:
-    async def __init__(self, host):
+    def __init__(self, host):
         """Constructor for the Air Conditioner Controller object"""
         self.host = host
-        self.api = api.AirTouch(host)
-        await self.api.UpdateInfo()
+        self.api = AirTouch(host)
 
     async def get_info(self):
         """Update information using API"""
@@ -31,5 +31,6 @@ class Controller:
         else:
             await self.api.TurnAcOff(ac)
             
-controller = Controller("192.168.1.18")
-controller.set_power_ac(0, 1)
+controller = Controller("192.168.1.7")
+asyncio.run(controller.get_info())
+asyncio.run(controller.set_power_ac(1, 1))

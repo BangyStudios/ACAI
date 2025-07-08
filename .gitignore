@@ -1,3 +1,4 @@
-/frontend
-/src/__pycache__
-/src/lib/api/__pycache__
+.DS_Store
+.vscode/
+__pycache__
+config/

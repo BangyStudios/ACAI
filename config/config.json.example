@@ -1,0 +1,12 @@
+{
+    "daemon": {
+        "iot_ip": "", 
+        "db_host": "", 
+        "db_user": "acai", 
+        "db_password": "", 
+        "db_name": "acai"
+    }, 
+    "logger": {
+        "path_log": "./data/log.txt"
+    }
+}
