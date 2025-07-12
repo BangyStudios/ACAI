@@ -1,4 +1,5 @@
 .DS_Store
-.vscode/
-__pycache__
-config/
+*__pycache__/
+/config/config.json
+/data/
+/.vscode/
