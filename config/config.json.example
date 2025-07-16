@@ -1,5 +1,10 @@
 {
     "daemon": {
+        "ac_type": "AirTouch", 
+        "algorithm_type": "reactive", 
+        "algorithm_version": "v1_0", 
+        "T_target": 22, 
+        "T_target_sleep": 18, 
         "iot_ip": "", 
         "db_host": "", 
         "db_user": "acai", 
@@ -8,5 +13,25 @@
     }, 
     "logger": {
         "path_log": "./data/log.txt"
+    }, 
+    "algorithms": {
+        "reactive": {
+            "airflow_group_min": 0.2, 
+            "airflow_ramp_degree": 0.1
+        }
+    }, 
+    "drivers": {
+        "airtouch": {
+            "defaults": {
+                "temperature": {
+                    "default": 25.0, 
+                    "min": 16, 
+                    "max": 30
+                }
+            }, 
+            "cache_ttl_minutes": 5, 
+            "history_minutes": 15, 
+            "resample_interval_minutes": 5
+        }
     }
 }

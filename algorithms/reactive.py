@@ -22,62 +22,68 @@ class Reactive:
             T_groups_history: List[List[float]],
             interval_history: int,
             airflow_groups_current: List[float],
-            overshoot_max: float,
-            lag_max: float
+            airflow_min: float,
+            airflow_ramp_degree: float,
     ):
-        n_rooms = len(T_groups_current)
+        n_groups = len(T_groups_current)
         n_history = len(T_groups_history)
 
-        # ΔT_current = T_current - T_target
-        temp_diffs_current = [T - T_target for T in T_groups_current]
-        avg_temp_diff_current = sum(temp_diffs_current) / n_rooms if n_rooms else 0
+        # eT_current = T_current - T_target
+        eT_groups_current = [T_group_current - T_target for T_group_current in T_groups_current]
+        eT_groups_mean_current = sum(eT_groups_current) / n_groups if n_groups else 0
 
         # Compute temperature change rate per room using full history
-        temp_change_rates = []
-        for index_group in range(n_rooms):
+        dT_groups_rate = []
+        for index_group in range(n_groups):
             rates = []
             for t in range(1, n_history):
-                delta = T_groups_history[t][index_group] - T_groups_history[t - 1][index_group]
-                rates.append(delta / interval_history)
-            avg_rate = sum(rates) / len(rates) if rates else 0.0
-            temp_change_rates.append(avg_rate)
+                eT_group = T_groups_history[t][index_group] - T_groups_history[t - 1][index_group]
+                rates.append(eT_group / interval_history)
+            dT_group_rate = sum(rates) / len(rates) if rates else 0.0
+            dT_groups_rate.append(dT_group_rate)
 
-        # Aggregate metrics
-        avg_temp_change_rate = sum(temp_change_rates) / n_rooms if n_rooms else 0.0
         heating_mode = (mode_ac == "heat")
         cooling_mode = (mode_ac == "cool")
 
-        # Stable baseline
+        # Initialize target setpoint
         T_ac_target_next = T_ac_target_current
+        airflow_groups_mean_current = sum(airflow_groups_current) / n_groups
+        airflow_groups_next = []
 
+        # First: decide setpoint
         if heating_mode:
-            if avg_temp_diff_current < -lag_max and avg_temp_change_rate < 0.05:
-                T_ac_target_next = min(T_ac_target_current + 1, T_max)
-            elif avg_temp_diff_current > overshoot_max or avg_temp_change_rate > 0.2:
+            if eT_groups_mean_current < 0:
+                if airflow_groups_mean_current > 0.5:
+                    T_ac_target_next = min(T_ac_target_current + 1, T_max)
+                else:
+                    T_ac_target_next = max(T_ac_target_current - 1, T_target)
+            else:
                 T_ac_target_next = max(T_ac_target_current - 1, T_target)
         elif cooling_mode:
-            if avg_temp_diff_current > lag_max and avg_temp_change_rate > -0.05:
-                T_ac_target_next = max(T_ac_target_current - 1, T_min)
-            elif avg_temp_diff_current < -overshoot_max or avg_temp_change_rate < -0.2:
+            if eT_groups_mean_current > 0:
+                if airflow_groups_mean_current > 0.5:
+                    T_ac_target_next = max(T_ac_target_current - 1, T_min)
+                else:
+                    T_ac_target_next = min(T_ac_target_current + 1, T_target)
+            else:
                 T_ac_target_next = min(T_ac_target_current + 1, T_target)
 
-        airflow_groups_next = []
-        for index_group, (temp_diff_current, rate, airflow_current) in enumerate(
-                zip(temp_diffs_current, temp_change_rates, airflow_groups_current)):
-            airflow = airflow_current
+        # Then: decide airflow per room
+        for i, (T_group_current, dT_group_rate, airflow_group_current) in enumerate(
+                zip(T_groups_current, dT_groups_rate, airflow_groups_current)):
+            eT_group = abs(T_target - T_group_current)
+            airflow_group_next = min(1.0, max(airflow_min, eT_group * airflow_ramp_degree * 10))
+
             if heating_mode:
-                if temp_diff_current < -lag_max and rate < 0.05:
-                    airflow = 1.0
-                elif temp_diff_current > 0 or rate > 0.2:
-                    airflow = max(0.1, airflow_current * 0.7)
+                if T_group_current > T_target:
+                    airflow_group_next = max(airflow_min, airflow_group_current - 0.2)
             elif cooling_mode:
-                if temp_diff_current > lag_max and rate > -0.05:
-                    airflow = 1.0
-                elif temp_diff_current < 0 or rate < -0.2:
-                    airflow = max(0.1, airflow_current * 0.7)
+                if T_group_current < T_target:
+                    airflow_group_next = max(airflow_min, airflow_group_current - 0.2)
             else:
-                airflow = 0.0
-            airflow_groups_next.append(airflow)
+                airflow_group_next = 0.0
+
+            airflow_groups_next.append(airflow_group_next)
 
         self.logger.info(
             f"Generated command: T_ac_target_next={T_ac_target_next}, airflow_groups_next={airflow_groups_next}")
@@ -110,7 +116,7 @@ class Reactive:
                 T_groups_current, 
                 T_groups_history, 
                 interval_history, 
-                airflow_groups_current, 
-                self.config.get("overshoot_max", 1.5), 
-                self.config.get("lag_max", 0.2)
+                airflow_groups_current,
+                self.config.get("airflow_group_min", 0.1),
+                self.config.get("airflow_ramp_degree", 0.1),
             )
