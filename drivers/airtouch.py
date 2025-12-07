@@ -58,6 +58,7 @@ class AirTouchAC:
         self.db_base = db_base
         self.config = config.get_config().get("drivers", {}).get("airtouch", {})
         
+        self.iot_ip = iot_ip
         self.api = AirTouch(ipAddress=iot_ip)
         self.db = AirTouchDB(db=self.db_base, config=self.config)
         self._info: Optional[Dict[str, List]] = None
@@ -113,15 +114,17 @@ class AirTouchAC:
             if ac.PowerState == "On"
         ]
 
-    async def get_group_ids_with_sensor(self) -> List[GroupNumber]:
+    async def get_group_ids_filtered(self, ac_id: int = None, require_sensor: bool = True, require_on: bool = True) -> List[GroupNumber]:
         """Get list of group numbers that have temperature sensors."""
         return [
             int(group.GroupNumber) 
             for group in (await self.get_info()).get("groups", []) 
-            if group.Sensor == "Yes"
+            if (group.BelongsToAc == ac_id if ac_id is not None else True) and
+            (group.Sensor == "Yes" if require_sensor else True) and 
+            (group.PowerState == "On" if require_on else True)
         ]
 
-    async def get_ac_info(self, ac_id: AcNumber) -> Optional[AcInfo]:
+    async def get_ac_info(self, ac_id: AcNumber, retry_current: int = 0, retry_max: int = 3) -> Optional[AcInfo]:
         """Get complete information for a specific AC unit.
         
         Args:
@@ -130,23 +133,32 @@ class AirTouchAC:
         Returns:
             Dictionary with AC information or None if not found
         """
-        acs = (await self.get_info(update=True)).get("acs", [])
-        for ac in acs:
-            if ac.AcNumber == ac_id:
-                return {
-                    "AcNumber": ac_id,
-                    "AcFanSpeed": ac.AcFanSpeed,
-                    "AcMode": ac.AcMode, 
-                    "IsOn": ac.IsOn, 
-                    "PowerState": ac.PowerState,
-                    "Spill": ac.Spill, 
-                    "Temperature": float(ac.Temperature),
-                    "AcTargetSetpoint": int(ac.AcTargetSetpoint),
-                    "MinSetpoint": int(ac.MinSetpoint),
-                    "MaxSetpoint": int(ac.MaxSetpoint)
-                }
-        self.logger.error(f"Unable to find ac_id: {ac_id}")
-        return None
+        try:
+            acs = (await self.get_info(update=True)).get("acs", [])
+            for ac in acs:
+                if ac.AcNumber == ac_id:
+                        return {
+                            "AcNumber": ac_id,
+                            "AcFanSpeed": ac.AcFanSpeed,
+                            "AcMode": ac.AcMode, 
+                            "IsOn": ac.IsOn, 
+                            "PowerState": ac.PowerState,
+                            "Spill": ac.Spill, 
+                            "Temperature": float(ac.Temperature),
+                            "AcTargetSetpoint": int(ac.AcTargetSetpoint),
+                            "MinSetpoint": int(ac.MinSetpoint),
+                            "MaxSetpoint": int(ac.MaxSetpoint)
+                        }
+            self.logger.error(f"Unable to find ac_id: {ac_id}")
+        except Exception as e:
+            self.logger.error(f"Error parsing AC info for ac_id {ac_id}: {e}")
+            if retry_current < retry_max:
+                self.logger.info(f"Retrying get_ac_info for ac_id {ac_id}, attempt {retry_current + 1}")
+                self.api = AirTouch(ipAddress=self.iot_ip)  # Reinitialize API connection
+                return await self.get_ac_info(ac_id=ac_id, retry_current=retry_current + 1, retry_max=retry_max)
+            else:
+                self.logger.error(f"Max retries reached for ac_id {ac_id}, raising exception")
+                raise e
 
     async def get_mode_ac(self, ac_id: AcNumber) -> str:
         """Get the current mode of a specific AC unit."""
@@ -227,10 +239,10 @@ class AirTouchAC:
         
         Args:
             ac_id: The AC unit number to query
-            
+
         Returns:
             Dictionary with all required parameters for the algorithm
-        """        
+        """
         mode_ac = (await self.get_mode_ac(ac_id=ac_id)).lower()
         
         T_min, T_max = await self.get_range_T(ac_id=ac_id)
@@ -246,16 +258,16 @@ class AirTouchAC:
         T_ac_in_history = resampled_ac_last.get("Temperature", [])
 
         # Get group temperatures
-        T_groups_current = await self.get_T_groups(ac_id=ac_id)
-        group_ids_Sensor = await self.get_group_ids_with_sensor()
+        group_ids_filtered = await self.get_group_ids_filtered(ac_id=ac_id)
+        T_groups_current = [value for key, value in (await self.get_T_groups(ac_id=ac_id)).items() if key in group_ids_filtered]
+
+        # Process group history data
         resampled_groups_last = await self.db.get_resampled_groups_last(
             ac_id=ac_id, 
             n_last_mins=self.config.get("history_minutes"), 
             resample_mins=self.config.get("resample_interval_minutes"), 
-            group_ids=group_ids_Sensor
+            group_ids=group_ids_filtered
         )
-
-        # Process group history data
         T_groups_history = []
         if resampled_groups_last.get("groups"):
             for index_time in range(len(resampled_groups_last.get("datetime", []))):
@@ -265,7 +277,7 @@ class AirTouchAC:
                 ])
 
         # Get group airflows
-        airflow_groups_current = await self.get_airflow_groups(ac_id)
+        airflow_groups_current = [value for key, value in (await self.get_airflow_groups(ac_id)).items() if key in group_ids_filtered]
 
         return {
             "mode_ac": mode_ac,
@@ -274,11 +286,22 @@ class AirTouchAC:
             "T_ac_target_current": T_ac_target_current,
             "T_ac_in_current": T_ac_in_current,
             "T_ac_in_history": T_ac_in_history,
-            "T_groups_current": T_groups_current.values(),
+            "group_ids": group_ids_filtered,
+            "T_groups_current": T_groups_current,
             "T_groups_history": T_groups_history,
             "interval_history": self.config.get("resample_interval_minutes"),
-            "airflow_groups_current": airflow_groups_current.values()
+            "airflow_groups_current": airflow_groups_current
         }
+        
+    async def set_ac_power(self, ac_id: AcNumber, power_on: bool) -> None:
+        """Set power state for a specific AC unit."""
+        ac_ids_on = await self.get_ac_ids_on()
+        if power_on and ac_id not in ac_ids_on:
+            await self.api.TurnAcOn(acNumber=ac_id)
+        elif not power_on and ac_id in ac_ids_on:
+            await self.api.TurnAcOff(acNumber=ac_id)
+        else:
+            self.logger.info(f"AC {ac_id} power state is already set to {power_on}")
 
     async def set_T_ac_target(self, ac_id: AcNumber, T_ac_target: int) -> None:
         """Set target temperature for a specific AC unit."""
@@ -298,6 +321,21 @@ class AirTouchAC:
             if group_number in airflow_groups:
                 percentage = int(airflow_groups[group_number] * 100)
                 await self.api.SetGroupToPercentage(group_number, percentage)
+                
+    async def set_airflow_groups_list(self, ac_id, airflow_groups):
+        """Set airflow percentages for groups belonging to a specific AC unit.
+        
+        Args:
+            ac_id: The AC unit number that owns the groups
+            airflow_groups: List of airflow percentages (0-1) of groups with sensors
+        """
+        groups_info = await self.get_groups_info(ac_id, require_sensor=True)
+        for index_group, group in enumerate(groups_info):
+            if group.get("BelongsToAc") == ac_id:
+                if group.get("Sensor") == "Yes":
+                    percentage = int(airflow_groups[index_group] * 100)
+                    await self.api.SetGroupToPercentage(groupNumber=group.get("GroupNumber"), percent=percentage)
+        return airflow_groups
 
 class AirTouchDB:       
     def __init__(self, db, config):

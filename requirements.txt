@@ -13,3 +13,4 @@ pytz
 six
 tzdata
 Werkzeug
+requests

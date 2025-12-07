@@ -15,4 +15,4 @@ def setup_logger(logger_name, log_file, level):
     logger.addHandler(streamHandler)
     
 path_log = config.get_config().get("logger", {}).get("path_log", "./data/log.txt")
-setup_logger("logger", path_log, logging.DEBUG)
+setup_logger("logger", path_log, logging.INFO)
