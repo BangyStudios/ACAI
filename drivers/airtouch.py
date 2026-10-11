@@ -1,11 +1,12 @@
 
-from datetime import datetime, timedelta
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 import pandas as pd
-from lib.airtouch4pyapi.airtouch4pyapi.airtouch import AirTouch
-from utils import config
+
+from lib.airtouch4pyapi.airtouch4pyapi.airtouch import AirTouch, AirTouchStatus
+from utils import config, network
 from utils.util import get_key_value
 
 # Define type aliases for better type hints
@@ -53,11 +54,14 @@ fieldmap_airtouch_group = {
 }
             
 class AirTouchAC:
-    def __init__(self, iot_ip: str, db_base):
+    AIRTOUCH_PORTS = (9004, 9005)
+
+    def __init__(self, iot_mac: str, db_base, iot_ip: str = ""):
         self.logger = logging.getLogger("logger")
         self.db_base = db_base
         self.config = config.get_config().get("drivers", {}).get("airtouch", {})
         
+        self.iot_mac = iot_mac
         self.iot_ip = iot_ip
         self.api = AirTouch(ipAddress=iot_ip)
         self.db = AirTouchDB(db=self.db_base, config=self.config)
@@ -67,7 +71,29 @@ class AirTouchAC:
     async def ensure_tables(self) -> None:
         """Ensure database tables exist."""
         await self.db.ensure_tables()
-        
+
+    async def update_ip(self) -> Optional[str]:
+        """Scan the local network for this device's MAC and update self.iot_ip and the AirTouch API.
+
+        Returns:
+            The discovered IP address, or None if the device was not found (current IP is kept).
+        """
+        try:
+            ip_new = await network.get_ip_mac(self.iot_mac, ports=self.AIRTOUCH_PORTS)
+        except Exception as e:
+            self.logger.error(f"Error scanning network for AirTouch: {e}")
+            return None
+
+        if ip_new is None:
+            self.logger.warning(f"AirTouch with MAC {self.iot_mac} not found on local network")
+            return None
+
+        if ip_new != self.iot_ip:
+            self.logger.info(f"AirTouch IP changed: {self.iot_ip or '<unset>'} -> {ip_new}")
+            self.iot_ip = ip_new
+            self.api.IpAddress = ip_new  # AirTouch reads IpAddress on every request, so this takes effect immediately
+        return ip_new
+
     async def get_info(self, update: bool = False) -> Dict[str, List]:
         """Get current AC system information.
         
@@ -78,7 +104,14 @@ class AirTouchAC:
             Dictionary with 'acs' and 'groups' keys containing lists of ACs and groups
         """
         if self._info is None or update or self._should_update_cache():
+            self.api.Messages.clear()  # Library prints all accumulated messages on each call — clear to prevent O(n²) log growth
             await self.api.UpdateInfo()
+            if self.api.Status != AirTouchStatus.OK:
+                self.logger.warning(f"AirTouch update failed at {self.iot_ip} (status {self.api.Status.name}), scanning for MAC {self.iot_mac}")
+                ip_old = self.iot_ip
+                if await self.update_ip() not in (None, ip_old):
+                    self.api.Messages.clear()
+                    await self.api.UpdateInfo()
             self._info = {
                 "acs": self.api.GetAcs(), 
                 "groups": self.api.GetGroups()
@@ -154,7 +187,6 @@ class AirTouchAC:
             self.logger.error(f"Error parsing AC info for ac_id {ac_id}: {e}")
             if retry_current < retry_max:
                 self.logger.info(f"Retrying get_ac_info for ac_id {ac_id}, attempt {retry_current + 1}")
-                self.api = AirTouch(ipAddress=self.iot_ip)  # Reinitialize API connection
                 return await self.get_ac_info(ac_id=ac_id, retry_current=retry_current + 1, retry_max=retry_max)
             else:
                 self.logger.error(f"Max retries reached for ac_id {ac_id}, raising exception")
@@ -259,7 +291,7 @@ class AirTouchAC:
 
         # Get group temperatures
         group_ids_filtered = await self.get_group_ids_filtered(ac_id=ac_id)
-        T_groups_current = [value for key, value in (await self.get_T_groups(ac_id=ac_id)).items() if key in group_ids_filtered]
+        T_groups_current = {key: value for key, value in (await self.get_T_groups(ac_id=ac_id)).items() if key in group_ids_filtered}
 
         # Process group history data
         resampled_groups_last = await self.db.get_resampled_groups_last(

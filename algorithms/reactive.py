@@ -2,9 +2,8 @@ import logging
 import math
 from typing import List
 
-from flask.config import T
-
 from utils import config
+from utils.util import sigmoid
 
 class Reactive:
     def __init__(self, version="v1_0"):
@@ -12,10 +11,6 @@ class Reactive:
         self.logger = logging.getLogger('logger')
         self.config = config.get_config().get("algorithms", {}).get("reactive", {})
         
-    def sigmoid(self, x, radius=1.5, incline=2):
-        result = 1 - math.exp(-((x/(radius/2)))**incline)
-        return result
-
     def v1_0(
             self,
             mode_ac: str, 
@@ -25,19 +20,27 @@ class Reactive:
             T_ac_target_current: int, 
             T_ac_in_current: float, 
             T_ac_in_history: int, 
-            T_groups_current: List[float], 
+            T_groups_current: dict, 
             T_groups_history: List[List[float]], 
             interval_history: int, 
             airflow_groups_current: List[float], 
             airflow_group_min: float, 
             airflow_group_max: float, 
-            airflow_ramp_degree: float, 
+            airflow_ramp_degree: float,
+            group_ids: List[int]
     ):
-        n_groups = len(T_groups_current)
+        # Convert T_groups_current dict to list in group_ids order, stripping to float
+        T_groups_current_list = [float(T_groups_current[group_id]) for group_id in group_ids]
+        
+        n_groups = len(T_groups_current_list)
+        if n_groups < 1:
+            self.logger.warning("No valid groups for current AC → Skipping command generation")
+            return T_ac_target_current, [airflow_group_min] * len(group_ids)
+        
         n_history = len(T_groups_history)
 
         # eT_current = T_current - T_target
-        eT_groups_current = [T_group_current - T_target for T_group_current in T_groups_current]
+        eT_groups_current = [T_group_current - T_target for T_group_current in T_groups_current_list]
         eT_groups_mean_current = sum(eT_groups_current) / n_groups if n_groups else 0
 
         # Compute temperature change rate per room using full history
@@ -87,14 +90,22 @@ class Reactive:
 
         # Then: decide airflow per room
         for index_group, (T_group_current, dT_group_rate, airflow_group_current) in enumerate(
-                zip(T_groups_current, dT_groups_rate, airflow_groups_current)):
+                zip(T_groups_current_list, dT_groups_rate, airflow_groups_current)):
             eT_group = T_group_current - T_target
             airflow_group_next = airflow_group_current  # default value (i.e. no need for fan if no heating/cooling required)
 
             if heating_mode:
-                airflow_group_next = min(max(airflow_group_min, (self.sigmoid(-eT_group) if eT_group < 0 else 0) + airflow_group_min), 1.0)
+                if eT_group < 0:
+                    airflow_group_next = airflow_group_max
+                else:
+                    airflow_group_next = sigmoid(eT_group)
+                    airflow_group_next = min(max(airflow_group_min, airflow_group_next), airflow_group_max)
             elif cooling_mode:
-                airflow_group_next = min(max(airflow_group_min, (self.sigmoid(eT_group) if eT_group > 0 else 0) + airflow_group_min), 1.0)
+                if eT_group > 0:
+                    airflow_group_next = airflow_group_max
+                else:
+                    airflow_group_next = sigmoid(-eT_group)
+                    airflow_group_next = min(max(airflow_group_min, airflow_group_next), airflow_group_max)
 
             airflow_groups_next.append(round(airflow_group_next, 2))
 
@@ -112,10 +123,11 @@ class Reactive:
         T_ac_target_current: int, 
         T_ac_in_current: float, 
         T_ac_in_history: int, 
-        T_groups_current: List[float], 
+        T_groups_current: dict, 
         T_groups_history: List[List[float]], 
         interval_history: int, 
-        airflow_groups_current: List[float]
+        airflow_groups_current: List[float],
+        group_ids: List[int]
     ):
         if self.version == "v1_0":
             return self.v1_0(
@@ -131,6 +143,7 @@ class Reactive:
                 interval_history, 
                 airflow_groups_current, 
                 self.config.get("airflow_group_min", 0.1), 
-                self.config.get("airflow_group_max", 0.1), 
-                self.config.get("airflow_ramp_degree", 0.1), 
+                self.config.get("airflow_group_max", 1.0), 
+                self.config.get("airflow_ramp_degree", 0.1),
+                group_ids
             )

@@ -1,11 +1,13 @@
 import asyncio
-from datetime import datetime, date, time, timedelta
 import logging
+from datetime import date, datetime, time, timedelta
 
 import numpy as np
 
 from database import AsyncMySQLConnector
 from utils import config
+from utils.util import linear_ramp
+
 
 class Daemon:
     def __init__(self) -> None:
@@ -15,6 +17,7 @@ class Daemon:
         self.ac_type = self.config.get("ac_type")
         self.algorithm_type = self.config.get("algorithm_type")
         self.apis_enabled = self.config.get("apis_enabled", [])
+        self.T_offset_ac_group = self.config.get("T_offset_ac_group", {})
         
         self.algorithm = None
         self.apis = {}
@@ -33,6 +36,25 @@ class Daemon:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         
+    def apply_T_offset(self, ac_id: int, T_groups: dict, mode_ac: str) -> dict:
+        """Apply temperature offset to T_groups based on ac_id and group_id.
+
+        The offset represents sensor bias in the cooling direction: a negative offset
+        means the sensor reads too cold. When heating, this bias is reversed (the
+        sensor reads too cold → actual is warmer), so the correction is negated.
+        """
+        ac_id_str = str(ac_id)
+        if ac_id_str in self.T_offset_ac_group:
+            offsets = self.T_offset_ac_group[ac_id_str]
+            sign = -1 if mode_ac.lower() == "heat" else 1
+            adjusted_T_groups = {}
+            for group_id, T_value in T_groups.items():
+                group_id_str = str(group_id)
+                offset = offsets.get(group_id_str, 0)
+                adjusted_T_groups[group_id] = T_value + sign * offset
+            return adjusted_T_groups
+        return T_groups
+        
     async def sleep_until_next_n_minutes(self, n_minutes: int) -> None:
         if 60 % n_minutes != 0:
             raise ValueError("n_minutes must divide 60 (e.g. 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, or 60)")
@@ -48,7 +70,7 @@ class Daemon:
         if self.ac_type == "AirTouch":
             import drivers.airtouch
         
-            self.ac = drivers.airtouch.AirTouchAC(iot_ip=self.config.get("iot_ip"), db_base=self.db_base)
+            self.ac = drivers.airtouch.AirTouchAC(iot_mac=self.config.get("iot_mac"), iot_ip=self.config.get("iot_ip"), db_base=self.db_base)
 
             self.on_ai = {ac_id: False for ac_id in await self.ac.get_ac_ids()}
 
@@ -71,17 +93,27 @@ class Daemon:
             self.apis["solar"] = api.solar.Solar()
 
     async def setup_loop(self) -> None:
-        await self.db_base.connect()
-        await self.init_ac()
-        await self.init_algorithm()
-        await self.init_apis()
-        
-        self.setup_complete = True
+        while self.running:
+            try:
+                await self.db_base.connect()
+                self.logger.info("Database connection established")
+                await self.init_ac()
+                self.logger.info("AC initialized")
+                await self.init_algorithm()
+                self.logger.info("Algorithm initialized")
+                await self.init_apis()
+                self.logger.info("APIs initialized")
+                self.setup_complete = True
+                return
+            except Exception as e:
+                self.logger.error(f"Setup failed, retrying in {self.setup_sleep} seconds: {e}")
+                await asyncio.sleep(self.setup_sleep)
         
     async def loop_update_config(self) -> None:
         while self.running:
             try:
                 self.config = config.get_config().get("daemon")
+                self.T_offset_ac_group = self.config.get("T_offset_ac_group", {})
                 self.logger.info("Config successfully updated")
             except Exception as e:
                 self.logger.error(f"Failed to update config: {str(e)}")
@@ -154,18 +186,29 @@ class Daemon:
                 for ac_id in ac_ids:
                     try:                       
                         mode_ac = await self.ac.get_mode_ac(ac_id=ac_id)
-                        T_groups = await self.ac.get_T_groups(ac_id=ac_id)
-                        mean_T_groups = np.mean([float(value) for value in T_groups.values()])
-                        max_T_group = max([float(value) for value in T_groups.values()])
-                        min_T_group = min([float(value) for value in T_groups.values()])
+                        group_ids_filtered = await self.ac.get_group_ids_filtered(ac_id=ac_id, require_sensor=True, require_on=True)
+                        T_groups_dict = await self.ac.get_T_groups(ac_id=ac_id)
+                        T_groups_dict_offset = self.apply_T_offset(ac_id, T_groups_dict, mode_ac)
+                        T_groups = [float(T_group) for group_id, T_group in T_groups_dict_offset.items() if group_id in group_ids_filtered]
+                        if len(T_groups) > 0:
+                            mean_T_groups = sum([T_group for T_group in T_groups]) / len(T_groups)
+                        else:
+                            await log_set_ac_power(ac_id=ac_id, power_on=False)
+                            self.logger.warning(f"No valid groups for AC {ac_id} → Turning off and skipping")
+                            continue
+                        max_T_group = max([T_group for T_group in T_groups])
+                        min_T_group = min([T_group for T_group in T_groups])
 
                         if is_period_daytime:
                             self.logger.debug("Inside daytime period")
                             if mode_ac == mode_daytime:
-                                if consumption_net < -(0.60 * power_consumption) and max_T_group > T_target + eT_trigger_daytime:
+                                reluctance_on = linear_ramp(x=mean_T_groups, x_min=T_target + 3.0, x_max=T_target)
+                                consumption_ac_on = -(reluctance_on * power_consumption)
+                                consumption_ac_off = ((1 - reluctance_on) * power_consumption) + (power_consumption * 0.25)
+                                if consumption_net < consumption_ac_on and max_T_group > T_target + eT_trigger_daytime:
                                     self.logger.info(f"Turning on AC {ac_id} ({mode_ac}) due to excess solar ({consumption_net}) and high temperature ({max_T_group})")
                                     await log_set_ac_power(ac_id=ac_id, power_on=True)
-                                elif consumption_net > (0.60 * power_consumption):
+                                elif consumption_net > consumption_ac_off:
                                     if self.on_ai.get(ac_id):
                                         self.logger.info(f"Turning off AC {ac_id} ({mode_ac}) due to high power consumption ({consumption_net})")
                                         await log_set_ac_power(ac_id=ac_id, power_on=False)
@@ -196,15 +239,14 @@ class Daemon:
                         self.logger.debug(f"Successfully handled AC {ac_id}")
 
                     except Exception as e:
-                        self.logger.error(f"Failed to set power state for AC {ac_id}: {str(e)}")
+                        self.logger.error(f"Failed to set power state for AC {ac_id}: {str(e)}", exc_info=True)
                         continue
 
             except Exception as e:
-                self.logger.error(f"Failed in AC power loop: {str(e)}")
+                self.logger.error(f"Failed in AC power loop: {str(e)}", exc_info=True)
             
-            await self.sleep_until_next_n_minutes(1)
+            await self.sleep_until_next_n_minutes(5)
 
-                
     async def loop_run_algorithm(self) -> None:
         while self.running:
             try:
@@ -226,14 +268,15 @@ class Daemon:
                 for ac_id in ac_ids:
                     try:
                         params_algorithm_reactive = await self.ac.get_params_algorithm_reactive(ac_id=ac_id)
-                        mode_ac = params_algorithm_reactive.get("mode_ac")
+                        mode_ac = params_algorithm_reactive.get("mode_ac", "")
                         T_min = params_algorithm_reactive.get("T_min")
                         T_max = params_algorithm_reactive.get("T_max")
                         T_ac_target_current = params_algorithm_reactive.get("T_ac_target_current")
                         T_ac_in_current = params_algorithm_reactive.get("T_ac_in_current")
                         T_ac_in_history = params_algorithm_reactive.get("T_ac_in_history")
                         group_ids = params_algorithm_reactive.get("group_ids", [])
-                        T_groups_current = params_algorithm_reactive.get("T_groups_current")
+                        T_groups_current = params_algorithm_reactive.get("T_groups_current", {})
+                        T_groups_current_offset = self.apply_T_offset(ac_id, T_groups_current, mode_ac)
                         T_groups_history = params_algorithm_reactive.get("T_groups_history")
                         interval_history = params_algorithm_reactive.get("interval_history")
                         airflow_groups_current = params_algorithm_reactive.get("airflow_groups_current")
@@ -246,10 +289,11 @@ class Daemon:
                             T_ac_target_current=T_ac_target_current,
                             T_ac_in_current=T_ac_in_current,
                             T_ac_in_history=T_ac_in_history,
-                            T_groups_current=T_groups_current,
+                            T_groups_current=T_groups_current_offset,
                             T_groups_history=T_groups_history,
                             interval_history=interval_history,
-                            airflow_groups_current=airflow_groups_current
+                            airflow_groups_current=airflow_groups_current,
+                            group_ids=group_ids
                         )
 
                         airflow_groups_next = {group_id: airflow for group_id, airflow in zip(group_ids, airflow_groups_next)}
@@ -260,11 +304,11 @@ class Daemon:
                         self.logger.info(f"Successfully sent command to AC {ac_id}")
                     
                     except Exception as e:
-                        self.logger.error(f"Failed to process AC {ac_id}: {str(e)}")
+                        self.logger.error(f"Failed to process AC {ac_id}: {str(e)}", exc_info=True)
                         continue
                 
             except Exception as e:
-                self.logger.error(f"Failed in algorithm loop: {str(e)}")
+                self.logger.error(f"Failed in algorithm loop: {str(e)}", exc_info=True)
                 
             await self.sleep_until_next_n_minutes(1)
 
