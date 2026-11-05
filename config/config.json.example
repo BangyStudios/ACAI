@@ -1,37 +1,67 @@
 {
     "daemon": {
-        "ac_type": "AirTouch", 
-        "algorithm_type": "reactive", 
-        "algorithm_version": "v1_0", 
-        "T_target": 22, 
-        "T_target_sleep": 18, 
-        "iot_ip": "", 
-        "db_host": "", 
-        "db_user": "acai", 
-        "db_password": "", 
-        "db_name": "acai"
-    }, 
+        "ac_type": "AirTouch",
+        "algorithm_type": "reactive",
+        "algorithm_version": "v1_0",
+        "T_target": 24,
+        "T_target_sleep": 24,
+        "periods": {
+            "daytime": ["07:30", "20:00"],
+            "morning": ["06:30", "07:30"]
+        },
+        "periods_modes": {
+            "daytime": "Cool",
+            "morning": "Heat"
+        },
+        "periods_eT_trigger": {
+            "daytime": 0.0,
+            "morning": 2.0
+        },
+        "power_consumption": 6000,
+        "iot_ip": "",
+        "iot_mac": null,
+        "db_host": "",
+        "db_user": "acai",
+        "db_password": "",
+        "db_name": "acai",
+        "apis_enabled": ["solar"],
+        "T_offset_ac_group": {
+            "0": {
+                "4": -1.0
+            },
+            "1": {
+                "7": -1.5
+            }
+        }
+    },
     "logger": {
         "path_log": "./data/log.txt"
-    }, 
+    },
     "algorithms": {
         "reactive": {
-            "airflow_group_min": 0.2, 
-            "airflow_ramp_degree": 0.1
+            "airflow_group_min": 0.1,
+            "airflow_group_max": 1.0,
+            "airflow_ramp_degree": 1.0
         }
-    }, 
+    },
     "drivers": {
         "airtouch": {
             "defaults": {
                 "temperature": {
-                    "default": 25.0, 
-                    "min": 16, 
+                    "default": 25.0,
+                    "min": 16,
                     "max": 30
                 }
-            }, 
-            "cache_ttl_minutes": 5, 
-            "history_minutes": 15, 
+            },
+            "cache_ttl_minutes": 5,
+            "history_minutes": 15,
             "resample_interval_minutes": 5
+        }
+    },
+    "api": {
+        "power": {
+            "url_consumption_net": "http://192.168.1.2:5007/consumption/net",
+            "timeout": 10
         }
     }
 }
