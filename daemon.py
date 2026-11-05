@@ -187,7 +187,7 @@ class Daemon:
                     try:                       
                         mode_ac = await self.ac.get_mode_ac(ac_id=ac_id)
                         group_ids_filtered = await self.ac.get_group_ids_filtered(ac_id=ac_id, require_sensor=True, require_on=True)
-                        T_groups_dict = await self.ac.get_T_groups(ac_id=ac_id)
+                        T_groups_dict = await self.ac.get_T_groups(ac_id=ac_id, update=False)  # get_mode_ac just refreshed
                         T_groups_dict_offset = self.apply_T_offset(ac_id, T_groups_dict, mode_ac)
                         T_groups = [float(T_group) for group_id, T_group in T_groups_dict_offset.items() if group_id in group_ids_filtered]
                         if len(T_groups) > 0:
