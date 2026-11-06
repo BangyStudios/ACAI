@@ -4,7 +4,7 @@ import logging
 import re
 import socket
 import subprocess
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("logger")
 
@@ -52,11 +52,10 @@ def read_arp_table() -> Dict[str, str]:
     return table
 
 
-async def get_ip_mac(mac: str, ports: Tuple[int, ...], concurrency: int = 64) -> Optional[str]:
-    """Scan the local /24 for a device with the given MAC. Returns its IP, or None if not found."""
-    target_mac = get_normalize_mac(mac)
+async def get_ips_macs(macs: List[str], ports: Tuple[int, ...], concurrency: int = 64) -> Dict[str, Optional[str]]:
+    """Scan the local /24 once and look up each MAC. Returns {mac: ip or None} keyed by the MACs as given."""
     network = get_local_network()
-    logger.info(f"Scanning {network} for MAC {target_mac}")
+    logger.info(f"Scanning {network} for MACs {', '.join(macs)}")
 
     sem = asyncio.Semaphore(concurrency)
 
@@ -65,4 +64,13 @@ async def get_ip_mac(mac: str, ports: Tuple[int, ...], concurrency: int = 64) ->
             await probe(ip, ports)
 
     await asyncio.gather(*(limited_probe(str(ip)) for ip in network.hosts()))
-    return (await asyncio.to_thread(read_arp_table)).get(target_mac)
+    table = await asyncio.to_thread(read_arp_table)
+    ips_macs: Dict[str, Optional[str]] = dict()
+    for mac in macs:
+        ips_macs[mac] = table.get(get_normalize_mac(mac))
+    return ips_macs
+
+
+async def get_ip_mac(mac: str, ports: Tuple[int, ...], concurrency: int = 64) -> Optional[str]:
+    """Scan the local /24 for a device with the given MAC. Returns its IP, or None if not found."""
+    return (await get_ips_macs([mac], ports=ports, concurrency=concurrency))[mac]

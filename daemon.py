@@ -70,7 +70,8 @@ class Daemon:
         if self.ac_type == "AirTouch":
             import drivers.airtouch
         
-            self.ac = drivers.airtouch.AirTouchAC(iot_mac=self.config.get("iot_mac"), iot_ip=self.config.get("iot_ip"), db_base=self.db_base)
+            iot_hosts = self.config.get("iot_hosts") or [{"ip": self.config.get("iot_ip"), "mac": self.config.get("iot_mac")}]  # Legacy single-host keys
+            self.ac = drivers.airtouch.AirTouchAC(iot_hosts=iot_hosts, db_base=self.db_base)
 
             self.on_ai = {ac_id: False for ac_id in await self.ac.get_ac_ids()}
 
@@ -181,13 +182,14 @@ class Daemon:
                 power_consumption = self.config.get("power_consumption", 0)
 
                 consumption_net = self.apis.get("solar").get_consumption_net()
+                await self.ac.get_info(update=True)  # The one refresh this tick (shared with the algorithm loop); reads below use the cache
                 ac_ids = await self.ac.get_ac_ids()
 
                 for ac_id in ac_ids:
                     try:                       
                         mode_ac = await self.ac.get_mode_ac(ac_id=ac_id)
                         group_ids_filtered = await self.ac.get_group_ids_filtered(ac_id=ac_id, require_sensor=True, require_on=True)
-                        T_groups_dict = await self.ac.get_T_groups(ac_id=ac_id, update=False)  # get_mode_ac just refreshed
+                        T_groups_dict = await self.ac.get_T_groups(ac_id=ac_id)
                         T_groups_dict_offset = self.apply_T_offset(ac_id, T_groups_dict, mode_ac)
                         T_groups = [float(T_group) for group_id, T_group in T_groups_dict_offset.items() if group_id in group_ids_filtered]
                         if len(T_groups) > 0:
@@ -264,6 +266,7 @@ class Daemon:
                 T_target_sleep = self.config.get("T_target_sleep")
                 T_target = T_target_sleep if is_sleep else T_target_base
 
+                await self.ac.get_info(update=True)  # The one refresh this tick; reads below use the cache
                 ac_ids = await self.ac.get_ac_ids()
                 for ac_id in ac_ids:
                     try:

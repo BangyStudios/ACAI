@@ -18,8 +18,9 @@
             "morning": 2.0
         },
         "power_consumption": 6000,
-        "iot_ip": "",
-        "iot_mac": null,
+        "iot_hosts": [
+            {"ip": "", "mac": null}
+        ],
         "db_host": "",
         "db_user": "acai",
         "db_password": "",
@@ -54,6 +55,8 @@
                 }
             },
             "cache_ttl_minutes": 5,
+            "update_interval_seconds": 50,
+            "rescan_interval_minutes": 15,
             "history_minutes": 15,
             "resample_interval_minutes": 5
         }
